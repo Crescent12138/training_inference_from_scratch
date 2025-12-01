@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms, models
-
+import torch.profiler as profiler
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -39,12 +39,19 @@ def get_datasets_ddp(data_dir: str, rank: int):
     return train_dataset, test_dataset
 
 
+
 def setup_dist():
+    # ----------  缺变量时自动补单机单卡 ----------
+    os.environ.setdefault("RANK",        "0")
+    os.environ.setdefault("WORLD_SIZE",  "1")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "12355")
+    # ---------------------------------------------
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     dist.init_process_group(backend=backend, init_method="env://")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank        = dist.get_rank()
+    world_size  = dist.get_world_size()
+    local_rank  = int(os.environ.get("LOCAL_RANK", 0))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
@@ -53,32 +60,37 @@ def setup_dist():
     return backend, rank, world_size, local_rank, device
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer, device: torch.device, epoch: int):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch,
+                    profiler_obj=None, max_prof_steps=None):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    for images, targets in loader:
+
+    for step, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-
         outputs = model(images)
         loss = criterion(outputs, targets)
-
         loss.backward()
-
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(outputs, 1)
         correct += (preds == targets).sum().item()
-        total += targets.size(0)
-    avg_loss = running_loss / max(total, 1)
-    acc = correct / max(total, 1)
-    return avg_loss, acc
+        total   += targets.size(0)
 
+        # ----  profiler step ----
+        if profiler_obj is not None:
+            profiler_obj.step()
+            if step + 1 >= max_prof_steps:      # 录够就停
+                break
+
+    avg_loss = running_loss / max(total, 1)
+    acc      = correct / max(total, 1)
+    return avg_loss, acc
 
 @torch.no_grad()
 def evaluate_global(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
@@ -108,6 +120,9 @@ def main():
     parser.add_argument("--save-path", type=str, default="/tmp/resnet18_mnist_ddp_multi_node.pth")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--profiler", action="store_true", help="enable PyTorch Profiler on rank 0")
+    parser.add_argument("--profiling-steps", type=int, default=20, help="how many train steps to record")
+    parser.add_argument("--profiling-dir", type=str, default="./log_prof", help="tensorboard trace folder")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -129,14 +144,30 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(ddp_model.parameters(), lr=1e-3)
+    prof, prof_steps = None, 0
+    if args.profiler and rank == 0:
+        prof_steps = args.profiling_steps
+        prof_schedule = profiler.schedule(wait=2, warmup=3, active=prof_steps)
+        prof = profiler.profile(
+                schedule=prof_schedule,
+                on_trace_ready=profiler.tensorboard_trace_handler(args.profiling_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True)
+        prof.start()    
 
     for epoch in range(1, args.epochs + 1):
         train_sampler.set_epoch(epoch)
-        train_loss, train_acc = train_one_epoch(ddp_model, train_loader, criterion, optimizer, device, epoch)
+        train_loss, train_acc = train_one_epoch(
+                ddp_model, train_loader, criterion, optimizer,
+                device, epoch, prof, prof_steps)
         test_acc = evaluate_global(ddp_model, test_loader, device)
         if rank == 0:
-            print(f"Epoch {epoch}/{args.epochs} | loss {train_loss:.4f} | train_acc {train_acc:.4f} | test_acc {test_acc:.4f}")
-
+            print(f"Epoch {epoch}/{args.epochs} | loss {train_loss:.4f} "
+                  f"| train_acc {train_acc:.4f} | test_acc {test_acc:.4f}")
+        if prof and epoch == 1:       # 录完第一个 epoch 就停
+            prof.stop()
+            prof = None
     if rank == 0:
         os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
         torch.save(ddp_model.module.state_dict(), args.save_path)
