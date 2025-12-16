@@ -723,6 +723,193 @@ def run_all_reduce(rank, world_size):
     cleanup()
 
 ```
+### 进程组
+#### 抽象定义
+
+进程组是 PyTorch 分布式训练中的核心抽象，代表了一组能够相互通信的进程集合。它本质上是一个通信域，定义了：
+- **通信参与者**：哪些进程可以参与集合通信（如 all-reduce、broadcast）。
+- **逻辑排名**：每个进程在组内的唯一标识。
+- **通信后端**：组内通信采用的协议（如 NCCL、Gloo、MPI）。
+- **资源划分**：在大模型训练中，进程组承载了资源划分与并行策略。
+
+    **关键特性**：**一个进程可以同时属于多个进程组**。这是实现混合并行（如 3D 并行）通信隔离的基础。
+
+
+**典型3D并行场景下的进程组映射**：
+```
+World Size = 128 GPUs (16 节点 × 8 GPU)
+├── 数据并行组：16 个组，每组 8 个 rank (8-way DP)
+├── 张量并行组：64 个组，每组 2 个 rank (2-way TP)
+├── 流水线并行组：2 个组，每组 64 个 rank (64-way PP)
+└── 全局通信组：1 个组，包含全部 128 个 rank
+```
+
+每个 GPU 进程同时隶属于一个 DP 组、一个 TP 组、一个 PP 组和全局组。
+---
+
+#### 核心作用
+
+| 作用             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| **通信隔离**     | 限制集合通信（如 `all_reduce`、`broadcast`）的作用范围，避免不必要的全局同步，降低通信开销。 |
+| **支持混合并行** | 为 DP、TP、PP 等不同并行维度提供独立通信域，实现正交通信策略。 |
+| **拓扑适配**     | 可基于硬件拓扑（如 NUMA、NVLink、多 NIC）自定义进程组，优化通信路径。 |
+| **容错与弹性**   | 支持动态重建进程组，实现故障恢复或弹性扩缩容（需配合弹性训练框架）。 |
+| **性能调优**     | 不同组可使用不同后端（如 TP 用 NCCL，PP 控制面用 Gloo），提升效率。 |
+
+
+1. **通信隔离**
+   - 避免不必要的全局同步，减少通信开销。
+   - 支持复杂混合并行策略（如数据并行与模型并行结合）。
+   - 隔离不同并行维度间的通信，避免干扰。
+
+2. **支持混合并行**
+   - 为不同并行维度（数据/张量/流水线并行）提供独立的通信域。
+
+3. **拓扑适配**
+   - 可手动创建子进程组，实现环状、树状或分层通信，以适配特定硬件拓扑（如多节点多网卡）并优化通信效率。
+
+4. **容错与弹性**
+   - 提供组内进程状态监控能力。
+   - 支持训练过程中动态增删进程。
+
+5. **性能调优**
+   - 不同组可使用不同后端（如 TP 用 NCCL，PP 控制面用 Gloo），提升效率。
+   - 同节点内优先通信：将张量并行（TP）组限制在同一节点内，利用高速互联（如 NVLink）。
+   - 跨节点用高带宽网络：确保数据并行（DP）组能高效利用 InfiniBand/RoCE。
+
+##### 性能调优番外
+| 并行类型         | 通信特点                | 推荐后端                                                |
+| ---------------- | ----------------------- | ------------------------------------------------------- |
+| 张量并行（TP）   | 高频、小批量、GPU-GPU   | NCCL（低延迟、高带宽）                                  |
+| 数据并行（DP）   | 中等频率、大梯度同步    | NCCL（支持 hierarchical all-reduce）                    |
+| 流水线并行（PP） | 低频、控制信号/激活传输 | Gloo（CPU 友好，支持灵活序列化）或 NCCL（若激活在 GPU） |
+---
+
+#### 使用方法
+##### 1. PyTorch 中的基本表示
+```python
+import torch.distributed as dist
+
+# 初始化默认进程组
+dist.init_process_group(backend='nccl', init_method='env://')
+
+# 获取默认进程组
+default_pg = dist.group.WORLD  # 或 dist.GroupMember.WORLD
+```
+
+##### 2. 创建包含指定 rank 的新进程组
+使用 `torch.distributed.new_group(ranks)` 创建子组，**所有进程**都必须调用此函数，即使不在 ranks 列表中，否则会阻塞。
+
+```python
+# 假设全局有 8 个 rank [0,1,2,3,4,5,6,7]
+# 创建一个仅包含 rank 0,1,2,3 的子组
+tp_group = dist.new_group(ranks=[0, 1, 2, 3])
+```
+
+##### 3. 在指定进程组中进行集合通信
+```python
+# 在 tp_group 内执行 all-reduce
+dist.all_reduce(tensor, group=tp_group)
+
+# 使用默认 WORLD 组（group 参数可省略）
+dist.all_reduce(tensor)  # 等价于 group=dist.Group.WORLD
+```
+
+##### 4. 获取进程组信息
+```python
+# 获取组内 rank
+local_rank = dist.get_rank(group=tp_group)
+
+# 获取组大小
+group_size = dist.get_world_size(group=tp_group)
+```
+
+##### 5. 使用默认进程组实现数据并行训练
+```python
+def train_step(model, data, target, optimizer):
+    # 前向传播
+    output = model(data)
+    loss = criterion(output, target)
+    
+    # 反向传播
+    loss.backward()
+    
+    # 使用 AllReduce 同步梯度
+    for param in model.parameters():
+        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        param.grad.data /= dist.get_world_size()  # 平均梯度
+    
+    # 参数更新
+    optimizer.step()
+```
+
+##### 6. 创建子进程组以支持模型并行
+```python
+def create_model_parallel_groups(world_size):
+    """
+    创建模型并行所需的进程组
+    """
+    model_parallel_groups = []
+    
+    # 假设划分两个模型并行组
+    ranks_list = [
+        [0, 1, 2, 3],  # 第一个模型并行组
+        [4, 5, 6, 7]   # 第二个模型并行组
+    ]
+    
+    for ranks in ranks_list:
+        # 创建新进程组
+        group = dist.new_group(ranks=ranks, backend='nccl')
+        model_parallel_groups.append(group)
+        
+        # 组内进程同步
+        if dist.get_rank() in ranks:
+            dist.barrier(group=group)
+    
+    return model_parallel_groups
+```
+
+##### 7. 容错与弹性训练示例
+```python
+class ElasticProcessGroup:
+    """
+    支持弹性训练的进程组管理器
+    """
+    def __init__(self):
+        self.store = dist.TCPStore("localhost", 1234, dist.get_world_size(), True)
+        
+    def add_new_processes(self, new_ranks):
+        """
+        动态添加新进程到进程组
+        """
+        # 使用 c10d 的进程组重新初始化功能
+        dist.new_group(ranks=new_ranks, timeout=timedelta(seconds=30))
+        
+    def remove_failed_processes(self, failed_ranks):
+        """
+        移除故障进程并重建进程组
+        """
+        active_ranks = [
+            r for r in range(dist.get_world_size())
+            if r not in failed_ranks
+        ]
+        new_group = dist.new_group(ranks=active_ranks)
+        return new_group
+```
+##### 8. 指定混合通信后端
+
+```python
+tp_group = dist.new_group(ranks=tp_ranks, backend="nccl")     # 高性能计算通信
+pp_group = dist.new_group(ranks=pp_ranks, backend="gloo")    # 控制面或 CPU buffer
+```
+#### 小结
+* 避免频繁创建/销毁组：new_group 开销较大，应在初始化阶段完成。
+* 组内通信对齐：所有组成员必须同步调用相同通信操作。
+* 后端选择：
+  -  GPU 间高效通信 → NCCL
+  -  CPU 或跨节点控制消息 → Gloo
+* 调试技巧：通过 dist.get_rank(group) 验证组成员是否符合预期。
 
 
 ### 3D并行
